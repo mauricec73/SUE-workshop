@@ -1,0 +1,575 @@
+# Workshop securing data in Kubernetes/etcd
+
+[https://git.sue.nl/maurice.commandeur/workshop-46-2022/ws-032023.md](https://git.sue.nl/maurice.commandeur/workshop-46-2022/ws-032023.md)
+
+Wat ik in deze workshop wil laten zien is hoe je de data in de Kubernetes Etcd database kun encrypten.
+We gaan delen van de database encrypten en weer teruug decrypten.
+Kubernetes beschrijving staat [hier](https://kubernetes.io/docs/tasks/administer-cluster/encrypt-data/)
+
+# _Note to self_ Mijn setup veranderen voor minikube
+Ik gebruik split-dns. dwz Dat ik op mijn laptop een dns server heb daaien die
+dns requests van de klant naar de klant dns doe en andere dns request naar
+specifieke andere dns servers.
+`sudo brew services stop dnsmasq`
+En zorg dat de dns entries vanuit de dhcp server actief worden.
+
+
+# Wat is een key value store
+Kubernetes gebruikt een database waar de waarheid van het cluster in staat.
+Het is dus belangrijk dat deze goed presteert en snel resultaten terug geeft.
+De etcd database is een key-value store. En is een key en daaraan hangt een value. Anders dan bijv Postgres zit er in
+een etc database geen query language. Je kunt het alleen via de API benaderen.
+
+# Minikube
+[Minikube installatie](https://minikube.sigs.k8s.io/docs/start/)
+```bash
+$ minikube start
+```
+En als je klaar bent of helemaal overnieuw wilt beginnen kun je
+```bash
+$ minikube delete --all
+$ minikube start
+```
+Je kunt ook met profielen werken en zo meerdere minikubes hebben met elk een eigen configuratie.
+Je kunt ook andere virtualisatie methodes gebruiken door
+```bash
+$ minikube start --driver=hyperkit (MacOS native)
+$ minikube start --driver=docker   (De docker engine)
+$ minikube start --driver=ssh      (Vertel minikube dat er een externe vm gebruikt moet worden)
+```
+
+Waarschijnlijk komt `kubectl` mee met de installatie van minikube. Anders kun je
+[hier](https://kubernetes.io/docs/tasks/tools/#kubectl) leren hoe je kubectl kunt installeren.
+
+# Secrets in Kubernetes
+## Secret aanmaken met kubectl
+Je hebt minikube gestart en nu gaan we een secret aanmaken
+```bash
+$ kubectl create ns test
+$ kubectl -n test create secret generic my-secret --from-literal=key1=supersecret
+```
+En meteen weer uitlezen wat je net hebt aangemaakt
+```bash
+$ kubectl -n test get secrets my-secret -o json
+{
+    "apiVersion": "v1",
+    "data": {
+        "key1": "c3VwZXJzZWNyZXQ="
+    },
+    "kind": "Secret",
+    "metadata": {
+        "creationTimestamp": "2023-01-12T20:03:00Z",
+        "name": "my-secret",
+        "namespace": "test",
+        "resourceVersion": "585",
+        "uid": "4718d98e-48b4-4c58-bd53-97179887d567"
+    },
+    "type": "Opaque"
+}
+$ echo `kubectl -n test get secrets my-secret -o jsonpath='{.data.key1}'` | base64 --decode
+```
+Hier zie je, je kunt de data direct weer terug lezen. De data is `base64` opgeslagen.
+
+## Waarde uitlezen in de Etcd database
+Waar het uiteindelijk om gaat is, dat de data encrypted wordt weggeschreven in de database.
+We gaan nu de secret my-secret uitlezen uit de Etcd database.
+```bash
+$ kubectl -n kube-system exec -it etcd-minikube -- sh
+sh-5.1# ETCDCTL_API=3 etcdctl \
+--cacert /var/lib/minikube/certs/etcd/ca.crt \
+--cert /var/lib/minikube/certs/etcd/server.crt \
+--key /var/lib/minikube/certs/etcd/server.key \
+get /registry/secrets/test/my-secret
+
+
+/registry/secrets/test/my-secret
+k8s
+
+
+v1Secret
+
+        my-secrettest"*$4718d98e-48b4-4c58-bd53-97179887d5672aB
+kubectl-createUpdatevFieldsV1:-
++{"f:data":{".":{},"f:key1":{}},"f:type":{}}B
+key1
+    supersecretOpaque"
+```
+Zie hier het bewijs dat de data plaintext is opgeslagen in de Etcd database.
+Hierboven wordt alleen een secret gebruikt, maar alle data is plaintext opgeslagen in de database. Ook bijvoorbeeld configmaps, tokens, routes en webhooks.
+
+## Encryptie naar de Etcd database aanzetten
+Nu gaan we de encryptie van database items aanzetten. Misschien heb je wel zin om alles aan te zetten, je systeem kan traag worden
+```bash
+$ minikube ssh
+$ sudo -i
+$ ps aux | grep "kube-apiserver" | grep "encryption-provider-config"
+$ grep "encryption-provider-config /etc/kubernetes/manifests/kube-apiserver.yaml
+```
+Er is geen encryption provider geconfigureerd zoals je ziet.
+De meest basale versie gaan we nu maken.
+```bash
+mkdir /etc/kubernetes/encryption
+tee /etc/kubernetes/encryption/encryption-conf.yaml << EOF
+apiVersion: apiserver.config.k8s.io/v1
+kind: EncryptionConfiguration
+resources:
+  - resources:
+      - secrets
+    providers:
+      - aescbc:
+          keys:
+            - name: key1
+              secret: $(head -c 32 /dev/urandom | base64)
+      - identity: {}
+EOF
+```
+Wat hebben we aangemaakt?
+Van het soort `EncryptionConfiguration` willen we dat de `resources` `resources` van het type `secrets` een encyptie aanzetten (`providers`) met encoding `aescbc`. De aescbc encryptie gebruikt deze keys met deze secrets. Er zijn meerdere keys mogelijk om te configureren. En meerdere resources mogelijk of \*.
+Het `identity: {}` item is de plaintext encryptie.
+
+We kunnen het ook ruimer nemen met een volgend voorbeeld:
+```bash
+EXAMPLE
+apiVersion: apiserver.config.k8s.io/v1
+kind: EncryptionConfiguration
+resources:
+  - resources:
+      - secrets
+      - configmaps
+      - pandas.awesome.bears.example
+    providers:
+      - aescbc:
+          keys:
+            - name: key1
+              secret: <BASE 64 ENCODED SECRET>
+      - identity: {}
+```
+
+Je hebt de encryptie configuratie in de VM gezet, maar moet uitgelezen worden door de kube-apiserver dat een pod is. Nu hebben we klein beetje hocus pocus nodig om die encryptie config in de pod te toveren.
+```bash
+$ vi /etc/kubernetes/manifests/kube-apiserver.yaml
+# Onder de spec.containers.[command] moet deze regel komen
+spec:
+  containers:
+  - command:
+    - kube-apiserver
+    - --encryption-provider-config=/etc/kubernetes/enc/encryption-conf.yaml
+# huh? maar dat is helemaal niet het pad van mijn config file
+# Dat komt bij de volumes
+# Onder spec.containers.volumeMounts moeten deze regels komen
+spec:
+  containers:
+    volumeMounts:
+    - mountPath: /etc/kubernetes/enc
+      name: enc-vol
+      readOnly: true
+# Deze maakt de directory in de kube-apiserver pod vanaf de minikube VM
+# Onder spec.volumes moeten deze regels komen
+spec:
+  volumes:
+  - hostPath:
+      path: /etc/kubernetes/encryption
+      type: DirectoryOrCreate
+    name: enc-vol
+# Deze linkt de/etc/kubernetes/encryption directory van de VM aan de /etc/kubernetes/enc directory in de pod.
+```
+Doordat het een manifest is worden alle veranderingen aan de `kube-apiserver.yaml` automatisch doorgevoerd. Even wachten tot de `kube-apiserver` opnieuw is opgestart.
+```bash
+$ ps aux | grep "kube-apiserver" | grep "encryption-provider-config"
+```
+En je ziet dat de config meegenomen is.
+Nu is niet standaard de inhoud van de Etcd database ge-encrypt. Alle nieuwe entries worden ge-encrypt. Alles wat geschreven/herschreven wordt zal worden ge-encrypt. Alle bestaande entries zullen unencrypted zijn.
+
+## Etcd database encrypten
+Nu bewijzen dat nieuwe entries ge-encrypt worden door dezelfde acties te doen als hierboven
+```
+$ kubectl -n test create secret generic new-secret --from-literal=key1=supersecret
+```
+En meteen weer uitlezen wat je net hebt aangemaakt
+```bash
+$ kubectl -n test get secrets new-secret -o json
+{
+    "apiVersion": "v1",
+    "data": {
+        "key1": "c3VwZXJzZWNyZXQ="
+    },
+    "kind": "Secret",
+    "metadata": {
+        "creationTimestamp": "2023-01-12T20:03:00Z",
+        "name": "my-secret",
+        "namespace": "test",
+        "resourceVersion": "585",
+        "uid": "4718d98e-48b4-4c58-bd53-97179887d567"
+    },
+    "type": "Opaque"
+}
+$ echo `kubectl -n test get secrets my-secret -o jsonpath='{.data.key1}'` | base64 --decode
+```
+
+## Waarde uitlezen in de Etcd database
+Waar het uiteindelijk om gaat is, dat de data encrypted wordt weggeschreven in de database.
+We gaan nu de secret new-secret uitlezen uit de Etcd database.
+
+```bash
+$ kubectl -n kube-system exec -it etcd-minikube -- sh
+sh-5.1# ETCDCTL_API=3 etcdctl \
+--cacert /var/lib/minikube/certs/etcd/ca.crt \
+--cert /var/lib/minikube/certs/etcd/server.crt \
+--key /var/lib/minikube/certs/etcd/server.key \
+get /registry/secrets/test/new-secret
+
+
+/registry/secrets/test/new-secret
+k8s:enc:aescbc:v1:key1:J{40}h*k@Ub_fw
+                                     O>2MdMh{n*Y̻c^f6uEsf3qq,<y_[s(gͿϳ?A)RV66X+09S]Q5B1D`B$_dJ>~^L
+
+                                                                                                 (rL)wzhTU>3}v?.<I%0XM_f\ڜ"štPP
+
+```
+Zie hier het bewijs dat de data niet meer plaintext is opgeslagen in de Etcd database.
+
+Via de officiele weg (de kube-apiserver) zijn de waarden uiteraard nog wel te lezen.
+```bash
+echo `kubectl -n test get secrets new-secret -o jsonpath='{.data.key1}'` | base64 --decode
+```
+
+## Alle entries in de Etcd database encrypten
+Om te zorgen dat alle entries in de `secrets` `resource` encrypted worden moet je ze eigenlijk allemaal lezen en weer terug scrijven.
+Gelukkig kan dit makkelijk als admin. We hebben in een vers cluster niet zo veel secrets dus we kunnen ze allemaal makkelijk opvragen.
+```
+$ kubectl get secrets --all-namespaces
+NAMESPACE     NAME                     TYPE                            DATA   AGE
+kube-system   bootstrap-token-iiaiaj   bootstrap.kubernetes.io/token   6      91m
+test          my-secret                Opaque                          1      86m
+test          new-secret               Opaque                          1      8m44s
+
+# Nu zie je alle content van de secrets via de api
+$ kubectl get secrets --all-namespaces -o json
+
+# Nu gaan we ze allemaal in de Etcd database opnieuw schrijven
+$ kubectl get secrets --all-namespaces -o json | kubectl replace -f -
+```
+
+Via de kube-apiserver (kubectl) zie je nu geen verandering maar wel in de database.
+
+Nadeel van deze methode is dat iedereen die toegang heeft tot de configuratie van de kube-apiserver de `aescbc` key kan lezen. Dus eigenlijk willen we een KMS provider zoals vault gebruiken om de keys uit de config (en versiebeheer) te halen.
+
+## Alle entries in de database decrypten
+Dit is eigenlijk heel makkelijk. Je hebt een config bestand `/etc/kubernetes/encryption/encryption-conf.yaml` aangemaakt met daarin de encryptie configuratie. Maar ook de volgorde van encrypten.
+Deze volgorde omdraaien. `kubectl replace` nog een keer draaien. De primaire encryptie is dan plain-text. En de secondaire encryptie is `aescbc`. Dus zal alles plain-text worden terug geschreven.
+
+# Installatie van KMS provider in minikube
+Het enige project dat ik ben tegengekomen voor een standalone Kubernetes (dus niet AWS of Google) is [Trousseau](https://github.com/ondat/trousseau). Aangezien ik dit binnenkort de encryptie van de etcd database weer moet aanzetten bij de klant inzetten heb ik hier voor gekozen.
+Documentatie staat ook [hier](https://docs.trousseau.io/trousseau/v1/deployment/)
+
+## Installatie Vault
+De installatie kun je [hier](https://developer.hashicorp.com/vault/downloads) vinden.
+Voor het gemak draaien we vault even lokaal. Niet in een container of in minikube.
+We starten vault op de volgende manier, doe dit in screen of in tmux
+```bash
+$ vault server -dev -dev-listen-address 0.0.0.0:8200 &
+---output snip---
+2023-01-16T09:24:01.646+0100 [INFO]  secrets.kv.kv_e3c99f6a: collecting keys to upgrade
+2023-01-16T09:24:01.646+0100 [INFO]  secrets.kv.kv_e3c99f6a: done collecting keys: num_keys=1
+2023-01-16T09:24:01.646+0100 [INFO]  secrets.kv.kv_e3c99f6a: upgrading keys finished
+WARNING! dev mode is enabled! In this mode, Vault runs entirely in-memory
+and starts unsealed with a single unseal key. The root token is already
+authenticated to the CLI, so you can immediately begin using Vault.
+
+You may need to set the following environment variables:
+
+    $ export VAULT_ADDR='http://0.0.0.0:8200'
+
+    The unseal key and root token are displayed below in case you want to
+    seal/unseal the Vault or re-authenticate.
+
+    Unseal Key: Y+9u9Co1dstQ2IK72fcW6tuQziywUznIzmRMp546Rms=
+    Root Token: hvs.LeEybvCzfTv4BwCmjtWJQjqN
+
+    Development mode should NOT be used in production installations!
+---output snip---
+$ export VAULT_ADDR='http://0.0.0.0:8200'
+$ export VAULT_TOKEN='hvs.LeEybvCzfTv4BwCmjtWJQjqN'
+$ vault status
+```
+Nu is vault in developer mode gestart. Alles staat volledig in memory.
+
+## Trousseau service account
+We hebben een service account nodig om de encryptie aan te zetten. Dus niet alleen via de config file zoals bij het
+eerste gedeelte.
+```bash
+$ kubectl -n kube-system create serviceaccount vault-auth
+$ tee vault-auth-serviceaccount.yaml <<EOF
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+   name: role-tokenreview-binding
+   namespace: kube-system
+roleRef:
+   apiGroup: rbac.authorization.k8s.io
+   kind: ClusterRole
+   name: system:auth-delegator
+subjects:
+- kind: ServiceAccount
+  name: vault-auth
+  namespace: kube-system
+EOF
+$ kubectl apply -f vault-auth-serviceaccount.yaml
+```
+Nu de service account details verzamelen om in vault weg te schrijven
+```bash
+$ kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Secret
+metadata:
+  name: vault-auth
+  namespace: kube-system
+  annotations:
+    kubernetes.io/service-account.name: vault-auth
+type: kubernetes.io/service-account-token
+EOF
+
+$ export SA_JWT_TOKEN=$(kubectl -n kube-system get secret vault-auth --output 'go-template={{ .data.token }}' | base64 --decode)
+$ export SA_CA_CRT=$(kubectl -n kube-system config view --raw --minify --flatten --output 'jsonpath={.clusters[].cluster.certificate-authority-data}' | base64 --decode)
+$ export K8S_HOST=$(kubectl config view --raw --minify --flatten --output 'jsonpath={.clusters[].cluster.server}')
+# uiteindelijke certificaat tonen
+$ echo vault write auth/kubernetes/config token_reviewer_jwt="\"$SA_JWT_TOKEN\"" kubernetes_ca_cert="\"$SA_CA_CRT\"" issuer="\"https://kubernetes.default.svc.cluster.local\"" kubernetes_host="\"$K8S_HOST\""
+```
+## Vault config
+In het volgende stukje gaan we Vault configureren en een access policy aanzetten.
+```bash
+$ vault secrets enable transit
+$ vault write -f transit/keys/trousseau-kms-vault
+```
+Transit access policy aanmaken
+```bash
+$ vault policy write trousseau-transit-ro -<<EOF
+path "transit/encrypt/trousseau-kms-vault" {
+   capabilities = [ "update" ]
+}
+path "transit/decrypt/trousseau-kms-vault" {
+   capabilities = [ "update" ]
+}
+EOF
+```
+Een dedicated token aanmaken om te transit engine te benaderen
+```bash
+$ vault token create -policy=trousseau-transit-ro
+$ export TROUSSEAU_TOKEN="hvs.CAESIKObpr5-htk3uwtD_m3M_KULvGy0vVvdduSllBWykN7YGh4KHGh2cy40dlNnbTZyVHpRV1V4eFZXYU5NQlFnNDc"
+```
+Een key-value policy store aanmaken voor Trousseau
+```bash
+vault policy write trousseau-kv-ro - <<EOF
+path "secret/data/trousseau/*" {
+    capabilities = ["read", "list"]
+}
+EOF
+```
+Trousseau config in de Vault keystore zetten
+```bash
+vault kv put /secret/trousseau/config transitkeyname=trousseau-kms-vault \
+vaultaddress=$VAULT_ADDR vaulttoken=$TROUSSEAU_TOKEN \
+ ttl=30s
+```
+Kubernetes Auth methode aanzetten in Vault
+```bash
+vault auth enable kubernetes
+```
+De Kubernetes Auth methode aanzetten in Vault. Gebruik het `vault write` commando van eerder.
+```bash
+vault write auth/kubernetes/config token_reviewer_jwt="eyJhbGciOiJSUzI1NiIsImtpZCI6Ilk1VDRxS3JpTUlRWmhwbVc4eEhHVkliTkt6bTRTQ1h3b3JmOEFyZ2Y3NEUifQ.eyJpc3MiOiJrdWJlcm5ldGVzL3NlcnZpY2VhY2NvdW50Iiwia3ViZXJuZXRlcy5pby9zZXJ2aWNlYWNjb3VudC9uYW1lc3BhY2UiOiJrdWJlLXN5c3RlbSIsImt1YmVybmV0ZXMuaW8vc2VydmljZWFjY291bnQvc2VjcmV0Lm5hbWUiOiJ2YXVsdC1hdXRoIiwia3ViZXJuZXRlcy5pby9zZXJ2aWNlYWNjb3VudC9zZXJ2aWNlLWFjY291bnQubmFtZSI6InZhdWx0LWF1dGgiLCJrdWJlcm5ldGVzLmlvL3NlcnZpY2VhY2NvdW50L3NlcnZpY2UtYWNjb3VudC51aWQiOiI1YzAwYzg2Mi1iYTgwLTRjNzEtYjEyMi1mYTQ4ZjllY2MxMGYiLCJzdWIiOiJzeXN0ZW06c2VydmljZWFjY291bnQ6a3ViZS1zeXN0ZW06dmF1bHQtYXV0aCJ9.ahKqYNrCwvE5FhNgvAyLFwSGaWhaZ4IH8OfymUs6jYUxZm7RmtMWEG-c7FsMwac9IIO4ffHorRV90Ge5zJGCi2KleLZHoZK9ADjMs4w-SLVjl6w4zGUT2lbp7ZzDmPQKmQC4AGwmnzu3rGvl_LDuM57aVTTSE09Rs7ReHWNtrSBBLhY-G11Mxx9FUaaPqKKEffzzUm-lbfHWOJ73CGhj8NGXbAQq_iGGCzQnJ6f68km6cgHdmmLKeuYe404ImbmDqfgiFJIkW1ksQCTbHyBJfk5hME2RwykzoYt1jqwG7PqUpv47WU9DjIpRL5cGwLiVcQHp2KSk96vETbxXhsWjJw" kubernetes_ca_cert="\"$SA_CA_CRT\"" issuer="\"https://kubernetes.default.svc.cluster.local\"" kubernetes_host="\"$K8S_HOST\""
+```
+Bij mij wilde de variable die voor token_reviewer_jwt gezet was niet direct. Na wat spelen met base64 en copy paste wilde hij ineens wel.
+Nu een link maken tussen de serivce account, namespace en policies in vault
+```bash
+$ vault write auth/kubernetes/role/trousseau \
+        bound_service_account_names=vault-auth \
+        bound_service_account_namespaces=kube-system \
+        policies=trousseau-kv-ro \
+        ttl=24h
+```
+
+## Configmap voor Trousseau maken
+```bash
+$ tee vault-configmap.yaml <<EOF
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trousseau-vault-agent-config
+  namespace: kube-system
+data:
+  vault-agent-config.hcl: |
+    exit_after_auth = true
+    pid_file = "/home/vault/pidfile"
+    auto_auth {
+        method "kubernetes" {
+            mount_path = "auth/kubernetes"
+            config = {
+                role = "trousseau"
+            }
+        }
+        sink "file" {
+            config = {
+                path = "/home/vault/.vault-token"
+            }
+        }
+    }
+
+    template {
+    destination = "/etc/secrets/config.yaml"
+    contents = <<EOT
+    {{- with secret "secret/data/trousseau/config" }}
+    ---
+    provider: vault
+    vault:
+      keynames:
+      - {{ .Data.data.transitkeyname }}
+      address: {{ .Data.data.vaultaddress }}
+      token: {{ .Data.data.vaulttoken }}
+    {{ end }}
+    EOT
+    }
+EOF
+$ kubectl apply -f vault-configmap.yaml
+```
+
+## DaemonSet voor Trousseau
+```bash
+$ tee trousseau-daemonset.yaml <<EOF
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: vault-kms-provider
+  namespace: kube-system
+  labels:
+    tier: control-plane
+    app: vault-kms-provider
+spec:
+  selector:
+    matchLabels:
+      name: vault-kms-provider
+  template:
+    metadata:
+      labels:
+        name: vault-kms-provider
+    spec:
+      serviceAccountName: vault-auth
+      priorityClassName: system-cluster-critical
+      hostNetwork: true
+      initContainers:
+        - name: vault-agent
+          image: vault
+          securityContext:
+            privileged: true
+          args:
+            - agent
+            - -config=/etc/vault/vault-agent-config.hcl
+            - -log-level=debug
+          env:
+            - name: VAULT_ADDR
+              value: http://10.20.31.4:8200 # (your ip here)
+          volumeMounts:
+            - name: config
+              mountPath: /etc/vault
+            - name: shared-data
+              mountPath: /etc/secrets
+      containers:
+        - name: vault-kms-provider
+          image: ghcr.io/ondat/trousseau:v1.1.3
+          imagePullPolicy: Always
+          env:
+            #- name: VAULT_NAMESPACE    # For Enterprise - set the value for the namespace
+            #  value: admin
+            - name: VAULT_SKIP_VERIFY # For vault deployment with a self-signed certificate
+              value: "true"
+          args:
+            - -v=5
+            - --config-file-path=/opt/trousseau/config.yaml
+            - --listen-addr=unix:///opt/vault-kms/vaultkms.socket                            # [REQUIRED] Version of the key to use
+            - --zap-encoder=json
+            - --v=3
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: true
+            runAsUser: 0
+          ports:
+            - containerPort: 8787
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8787
+            failureThreshold: 3
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 300m
+              memory: 256Mi
+          volumeMounts:
+            - name: vault-kms
+              mountPath: /opt/vault-kms
+            - name: shared-data
+              mountPath: /opt/trousseau/
+      volumes:
+        - name: vault-kms
+          hostPath:
+            path: /opt/vault-kms
+        - configMap:
+            items:
+              - key: vault-agent-config.hcl
+                path: vault-agent-config.hcl
+            name: trousseau-vault-agent-config
+          name: config
+        - emptyDir: {}
+          name: shared-data
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: Exists
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/etcd
+          operator: Exists
+          effect: NoExecute
+EOF
+$ kubectl apply -f trousseau-daemonset.yaml
+$ kubectl -n kube-system get pods
+$ kubectl -n kube-system describe pod vault-kms-provider-g8qjz
+```
+De `vault-kms-provider` pod staat op status `init`. Dit komt doordat de socket waarmee hij met vault praat nog niet bestaat.
+
+## KMS provider plugin EncryptionConfiguration
+```bash
+$ tee encryption-config <<EOF
+---
+kind: EncryptionConfiguration
+apiVersion: apiserver.config.k8s.io/v1
+resources:
+  - resources:
+      - secrets
+    providers:
+      - kms:
+          name: vaultprovider
+          endpoint: unix:///opt/vault-kms/vaultkms.socket
+          cachesize: 1000
+      - identity: {}
+EOF
+# Zorg dat deze config in minikube komt. Zie voor voorbeeld hierboven
+```
+
+Nu heb ik last van dat de kms provider zeurt dat de socket niet bestaat. Deze zou aangemaakt moeten worden door de kube-apiserver (zover ik weet).
+
