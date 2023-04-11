@@ -1,7 +1,7 @@
 # SUE-workshop
 Workshops I create for SUE
 
-- 2315 - Open Policy Agent
-- 2307 - ConfigMaps & Secrets
-- 23-3 - etcd encryption
+- 23-15 - Open Policy Agent
+- 23-07 - ConfigMaps & Secrets
+- 23-03 - etcd encryption
 - 22-46 - Falco
